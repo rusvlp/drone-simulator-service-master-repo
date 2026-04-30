@@ -1,0 +1,9 @@
+numpy>=2.4
+Pillow>=12.0
+scipy>=1.17
+matplotlib>=3.10
+
+# Neural segmentation (--method segment)
+torch>=2.11
+torchvision>=0.26
+transformers>=5.6

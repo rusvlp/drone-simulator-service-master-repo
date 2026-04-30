@@ -1,0 +1,11 @@
+
+services:
+  frontend:
+    build:
+      \diploma-frontend
+    ports:
+      - "3000:5173"
+
+    gateway:
+      build:
+       \diploma-gateway
