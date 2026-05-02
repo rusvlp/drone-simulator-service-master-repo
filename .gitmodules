@@ -1,0 +1,12 @@
+[submodule "services/diploma-gateway"]
+	path = services/diploma-gateway
+	url = https://github.com/rusvlp/diploma-gateway
+[submodule "services/diploma-user-service"]
+	path = services/diploma-user-service
+	url = https://github.com/rusvlp/diploma-user-service
+[submodule "services/diploma-frontend"]
+	path = services/diploma-frontend
+	url = https://github.com/rusvlp/diploma-frontend
+[submodule "services/diploma-course-service"]
+	path = services/diploma-course-service
+	url = https://github.com/rusvlp/diploma-course-service
