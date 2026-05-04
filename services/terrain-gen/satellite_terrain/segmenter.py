@@ -60,6 +60,28 @@ _ADE20K_ELEV: dict[int, float] = {
 # Sky is atmospheric — not terrain; falls back to spectral classifier.
 _ADE20K_SKY_CLS = 2
 
+# ADE20K-150 class index → RGB color for segmentation texture
+_ADE20K_COLORS: dict[int, tuple[int, int, int]] = {
+    4:   ( 34, 139,  34),  # tree
+    9:   (124, 185,  93),  # grass
+    13:  (139, 119, 101),  # earth / ground
+    16:  (128, 128, 128),  # mountain
+    17:  ( 60, 179, 113),  # plant / shrub
+    21:  ( 30, 100, 180),  # water
+    26:  ( 30, 100, 180),  # sea
+    29:  (144, 238, 144),  # field
+    34:  (105, 105, 105),  # rock / stone
+    46:  (210, 180, 140),  # sand / beach
+    60:  ( 30, 100, 180),  # river
+    68:  (107, 142,  35),  # hill
+    72:  ( 34, 139,  34),  # palm tree
+    94:  (139, 119, 101),  # land / soil
+    113: ( 30, 100, 180),  # waterfall
+    128: ( 30, 100, 180),  # lake
+    2:   (135, 206, 235),  # sky (fallback)
+}
+_ADE20K_DEFAULT_COLOR: tuple[int, int, int] = (160, 130, 100)  # unclassified → earth
+
 
 # ---------------------------------------------------------------------------
 # Pascal VOC-21 class index (0-based) → base elevation [0, 1]
@@ -68,6 +90,12 @@ _VOC_ELEV: dict[int, float] = {
     0:  0.25,   # background → generic lowland
     16: 0.38,   # pottedplant → treat as vegetation
 }
+
+_VOC_COLORS: dict[int, tuple[int, int, int]] = {
+    0:  (160, 130, 100),  # background → earth
+    16: ( 60, 179, 113),  # potted plant → green
+}
+_VOC_DEFAULT_COLOR: tuple[int, int, int] = (160, 130, 100)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +202,19 @@ def _classes_to_heights(
     return height
 
 
+def _classes_to_texture(
+    seg_map: np.ndarray,
+    color_map: dict[int, tuple[int, int, int]],
+    default_color: tuple[int, int, int] = (160, 130, 100),
+) -> np.ndarray:
+    """Map segmentation class IDs to float32 RGB texture (values in [0, 1])."""
+    H, W = seg_map.shape
+    tex = np.full((H, W, 3), default_color, dtype=np.float64)
+    for cls_id, color in color_map.items():
+        tex[seg_map == cls_id] = color
+    return (tex / 255.0).astype(np.float32)
+
+
 def _tile_weight(
     tile_h: int, tile_w: int,
     y0: int, x0: int,
@@ -210,21 +251,24 @@ def _segment_tiled(
     sky_cls: int | None,
     tile_size: int,
     overlap: int,
-) -> np.ndarray:
+    color_map: dict[int, tuple[int, int, int]] | None = None,
+    default_color: tuple[int, int, int] = (160, 130, 100),
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Process a large image tile-by-tile and blend results with linear-ramp weights.
 
     Tiles are placed on a regular grid with `overlap` pixels between neighbours.
     The final heightmap is the weighted average of all tiles at each pixel.
+    When `color_map` is provided, also returns a blended RGB texture.
     """
     H, W = image_rgb.shape[:2]
     stride = tile_size - overlap
 
     # Build tile top-left coordinates; ensure the last tile reaches the edge.
     def positions(length: int) -> list[int]:
-        pts = list(range(0, length, stride))
-        if not pts or pts[-1] + tile_size < length:
-            pts.append(max(0, length - tile_size))
+        max_start = max(0, length - tile_size)
+        pts = list(range(0, max_start, stride))
+        pts.append(max_start)
         return sorted(set(pts))
 
     y_starts = positions(H)
@@ -233,8 +277,9 @@ def _segment_tiled(
     print(f"    Tiling {len(x_starts)} x {len(y_starts)} = {n_tiles} tiles  "
           f"(tile={tile_size}px  overlap={overlap}px)")
 
-    height_acc = np.zeros((H, W), dtype=np.float64)
-    weight_acc = np.zeros((H, W), dtype=np.float64)
+    height_acc  = np.zeros((H, W), dtype=np.float64)
+    weight_acc  = np.zeros((H, W), dtype=np.float64)
+    texture_acc = np.zeros((H, W, 3), dtype=np.float64) if color_map is not None else None
 
     for idx, (y0, x0) in enumerate(
         (y, x) for y in y_starts for x in x_starts
@@ -250,12 +295,23 @@ def _segment_tiled(
 
         height_acc[y0:y1, x0:x1] += tile_h * weight
         weight_acc[y0:y1, x0:x1] += weight
+
+        if texture_acc is not None:
+            tile_tex = _classes_to_texture(seg_map, color_map, default_color)
+            texture_acc[y0:y1, x0:x1] += tile_tex * weight[:, :, np.newaxis]
+
         print(f"    [{idx + 1}/{n_tiles}]  y={y0}:{y1}  x={x0}:{x1}")
 
-    valid = weight_acc > 1e-9
-    result = np.zeros((H, W), dtype=np.float64)
-    result[valid] = height_acc[valid] / weight_acc[valid]
-    return result.astype(np.float32)
+    valid  = weight_acc > 1e-9
+    result = np.zeros((H, W), dtype=np.float32)
+    result[valid] = (height_acc[valid] / weight_acc[valid]).astype(np.float32)
+
+    if texture_acc is not None:
+        texture = np.zeros((H, W, 3), dtype=np.float32)
+        texture[valid] = (texture_acc[valid] / weight_acc[valid, np.newaxis]).astype(np.float32)
+        return result, texture
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +354,8 @@ def segment(
     device: str = "auto",
     tile_size: int = TILE_SIZE,
     overlap: int = TILE_OVERLAP,
-) -> np.ndarray:
+    return_texture: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Estimate terrain elevation from a satellite image via semantic segmentation.
 
@@ -307,33 +364,44 @@ def segment(
     px blending margin. Smaller images are processed in one pass.
 
     Args:
-        image_rgb: (H, W, 3) float32 array, values in [0, 1].
-        backbone:  'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
-        device:    'auto', 'cpu', 'cuda', or 'mps'.
-        tile_size: Side length of each tile in pixels (default: 512).
-        overlap:   Overlap between adjacent tiles in pixels (default: 64).
+        image_rgb:      (H, W, 3) float32 array, values in [0, 1].
+        backbone:       'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
+        device:         'auto', 'cpu', 'cuda', or 'mps'.
+        tile_size:      Side length of each tile in pixels (default: 512).
+        overlap:        Overlap between adjacent tiles in pixels (default: 64).
+        return_texture: When True, also return an (H, W, 3) float32 RGB texture
+                        where each pixel is colored by its semantic class.
 
     Returns:
-        raw_heights: (H, W) float32 array, values in [0, 1].
+        raw_heights (H, W) float32, or (raw_heights, texture_rgb) when return_texture=True.
     """
     device = resolve_device(device)
 
     if backbone == "segformer":
-        run_fn   = lambda img: _run_segformer(img, device)
-        elev_map = _ADE20K_ELEV
-        sky_cls  = _ADE20K_SKY_CLS
+        run_fn        = lambda img: _run_segformer(img, device)
+        elev_map      = _ADE20K_ELEV
+        sky_cls       = _ADE20K_SKY_CLS
+        color_map     = _ADE20K_COLORS
+        default_color = _ADE20K_DEFAULT_COLOR
     elif backbone == "deeplabv3":
-        run_fn   = lambda img: _run_deeplabv3(img, device)
-        elev_map = _VOC_ELEV
-        sky_cls  = None
+        run_fn        = lambda img: _run_deeplabv3(img, device)
+        elev_map      = _VOC_ELEV
+        sky_cls       = None
+        color_map     = _VOC_COLORS
+        default_color = _VOC_DEFAULT_COLOR
     else:
         raise ValueError(f"Unknown backbone {backbone!r}. Choose 'segformer' or 'deeplabv3'.")
 
+    cm = color_map if return_texture else None
     H, W = image_rgb.shape[:2]
 
     if max(H, W) > TILE_THRESHOLD:
-        return _segment_tiled(image_rgb, run_fn, elev_map, sky_cls, tile_size, overlap)
+        return _segment_tiled(image_rgb, run_fn, elev_map, sky_cls,
+                              tile_size, overlap, cm, default_color)
 
     # Image fits in one pass.
     seg_map = run_fn(image_rgb)
-    return _classes_to_heights(seg_map, image_rgb, elev_map, sky_cls).astype(np.float32)
+    heights = _classes_to_heights(seg_map, image_rgb, elev_map, sky_cls).astype(np.float32)
+    if return_texture:
+        return heights, _classes_to_texture(seg_map, color_map, default_color)
+    return heights

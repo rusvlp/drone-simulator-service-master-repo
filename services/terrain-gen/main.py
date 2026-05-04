@@ -43,7 +43,10 @@ DEMO MODE  (no input image needed):
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message="Failed to find CUDA", category=UserWarning)
 
 import numpy as np
 from PIL import Image
@@ -136,6 +139,9 @@ def process(
     device: str,
     tile_size: int,
     overlap: int,
+    scale_z: float = 0.3,
+    y_up: bool = False,
+    texture_mode: str = "photo",
 ) -> None:
     H, W = image_rgb.shape[:2]
     print(f"  Input size : {W}x{H} px")
@@ -165,12 +171,31 @@ def process(
         device = resolve_device(device)
         device_label = cuda_info() if device.startswith("cuda") else device.upper()
         print(f"  [segment] Neural segmentation  backbone={backbone}  device={device_label}  "
-              f"tile={tile_size}px  overlap={overlap}px")
-        raw = st.analyze_neural(image_rgb, backbone=backbone, device=device,
-                                tile_size=tile_size, overlap=overlap)
+              f"tile={tile_size}px  overlap={overlap}px  texture={texture_mode}")
+
+        need_seg_tex = (texture_mode == "classified")
+        seg_result = st.analyze_neural(image_rgb, backbone=backbone, device=device,
+                                       tile_size=tile_size, overlap=overlap,
+                                       return_texture=need_seg_tex)
+        if need_seg_tex:
+            raw, seg_texture = seg_result
+        else:
+            raw = seg_result
+
         print(f"  Smoothing  (sigma={smooth_sigma}, sea_level={sea_level})...")
         hmap = st.build(raw, smooth_sigma=smooth_sigma, sea_level=sea_level)
-        obj_texture = f"{stem}_terrain.png"
+
+        if texture_mode == "photo":
+            tex_filename = f"{stem}_satellite.png"
+            st.save_texture(image_rgb, output_dir / tex_filename)
+            obj_texture = tex_filename
+        elif texture_mode == "classified":
+            tex_filename = f"{stem}_classified.png"
+            Image.fromarray((seg_texture * 255).astype(np.uint8), mode="RGB").save(
+                str(output_dir / tex_filename))
+            obj_texture = tex_filename
+        else:
+            obj_texture = f"{stem}_terrain.png"
 
     elif method == "color":
         print("  [color] Spectral classification...")
@@ -199,7 +224,7 @@ def process(
         mesh_hmap = _subsample(hmap, max_dim=512)
         mH, mW = mesh_hmap.shape
         obj_path = output_dir / f"{stem}_terrain.obj"
-        st.save_obj(mesh_hmap, obj_path, texture_name=obj_texture)
+        st.save_obj(mesh_hmap, obj_path, texture_name=obj_texture, scale_z=scale_z, y_up=y_up)
         print(f"  -> {obj_path}  ({mW}x{mH} mesh, "
               f"{mW * mH:,} vertices, {2*(mW-1)*(mH-1):,} triangles)")
 
@@ -276,6 +301,25 @@ def main() -> None:
         help="Overlap between adjacent tiles in pixels (default: 64).",
     )
     parser.add_argument(
+        "--texture", choices=["photo", "classified", "terrain"],
+        default="photo",
+        help=(
+            "OBJ texture source: 'photo' (satellite image, default), "
+            "'classified' (semantic color map: water=blue, grass=green, soil=brown), "
+            "'terrain' (false-color elevation map)."
+        ),
+    )
+    parser.add_argument(
+        "--y-up", action="store_true",
+        help="Export OBJ with Y-up axes (X/Z ground plane) for Unity/Godot. "
+             "Default is Z-up (Blender convention).",
+    )
+    parser.add_argument(
+        "--scale-z", type=float, default=0.3, metavar="FACTOR",
+        help="Vertical scale of the OBJ mesh relative to XY extent (default: 0.3). "
+             "Use 0.1 for flatter terrain, 0.5 for more dramatic relief.",
+    )
+    parser.add_argument(
         "--no-obj", action="store_true",
         help="Skip OBJ mesh export.",
     )
@@ -322,6 +366,9 @@ def main() -> None:
         dem_grid=args.dem_grid,
         tile_size=args.tile_size,
         overlap=args.overlap,
+        scale_z=args.scale_z,
+        y_up=args.y_up,
+        texture_mode=args.texture,
     )
     print("Done.")
 

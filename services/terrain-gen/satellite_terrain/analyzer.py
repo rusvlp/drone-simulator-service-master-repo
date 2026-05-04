@@ -85,7 +85,10 @@ def _illumination_relief(gray: np.ndarray) -> np.ndarray:
 
 def _water_mask(rgb: np.ndarray) -> np.ndarray:
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    return (b > r + 0.04) & (b > g + 0.02) & ((r + g + b) / 3 < 0.70)
+    brightness = (r + g + b) / 3
+    blue_dominant = (b > r + 0.04) & (b > g + 0.02) & (brightness < 0.70)
+    dark_water    = (brightness < 0.12) & (r < 0.15) & (g < 0.18)
+    return blue_dominant | dark_water
 
 
 def _snow_mask(rgb: np.ndarray) -> np.ndarray:
@@ -104,33 +107,52 @@ def analyze_neural(
     device: str = "auto",
     tile_size: int = 512,
     overlap: int = 64,
-) -> np.ndarray:
+    return_texture: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Estimate a terrain heightmap using a neural segmentation backbone.
 
     Args:
-        image_rgb: (H, W, 3) float32 array, values in [0, 1].
-        backbone:  'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
-        device:    'auto', 'cpu', 'cuda', or 'mps'.
-        tile_size: Tile size for large-image tiling (default: 512).
-        overlap:   Overlap between tiles in pixels (default: 64).
+        image_rgb:      (H, W, 3) float32 array, values in [0, 1].
+        backbone:       'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
+        device:         'auto', 'cpu', 'cuda', or 'mps'.
+        tile_size:      Tile size for large-image tiling (default: 512).
+        overlap:        Overlap between tiles in pixels (default: 64).
+        return_texture: When True, also return (H, W, 3) float32 segmentation texture.
 
     Returns:
-        raw_heights: (H, W) float32 array, values in [0, 1].
+        raw_heights (H, W) float32, or (raw_heights, texture_rgb) when return_texture=True.
     """
     from .segmenter import segment as _neural
 
     gray = _luminance(image_rgb)
 
-    h_neural    = _neural(image_rgb, backbone=backbone, device=device,
-                          tile_size=tile_size, overlap=overlap).astype(np.float64)
+    seg_result  = _neural(image_rgb, backbone=backbone, device=device,
+                          tile_size=tile_size, overlap=overlap,
+                          return_texture=return_texture)
+    if return_texture:
+        h_neural, seg_texture = seg_result
+    else:
+        h_neural, seg_texture = seg_result, None
+    h_neural = h_neural.astype(np.float64)
+
+    # Remove outlier class tiers (e.g. rock/mountain misclassified in flat scenes)
+    p_lo, p_hi  = np.percentile(h_neural, [2, 98])
+    h_neural    = np.clip(h_neural, p_lo, p_hi)
+    if p_hi > p_lo:
+        h_neural = (h_neural - p_lo) / (p_hi - p_lo)
+
+    # Smooth class-boundary discontinuities, scaled to image size
+    D           = max(image_rgb.shape[:2])
+    h_neural    = gaussian_filter(h_neural, sigma=D / 50)
+
     h_roughness = _multiscale_roughness(gray)
     h_relief    = _illumination_relief(gray)
 
     height = (
-        0.55 * h_neural
-        + 0.28 * h_roughness
-        + 0.17 * h_relief
+        0.70 * h_neural
+        + 0.08 * h_roughness
+        + 0.22 * h_relief
     )
 
     water = _water_mask(image_rgb)
@@ -145,6 +167,8 @@ def analyze_neural(
     if h_max > h_min:
         height = (height - h_min) / (h_max - h_min)
 
+    if return_texture:
+        return height.astype(np.float32), seg_texture
     return height.astype(np.float32)
 
 

@@ -1,7 +1,47 @@
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
+
+
+def enhance_texture(
+    image_rgb: np.ndarray,
+    sharpen: float = 1.5,
+    saturation: float = 1.2,
+) -> np.ndarray:
+    """
+    Sharpen and boost saturation of a satellite texture.
+
+    Args:
+        image_rgb:  (H, W, 3) float32 array, values in [0, 1].
+        sharpen:    Sharpening strength — radius multiplier for UnsharpMask
+                    (0 = off, 1.0 = moderate, 2.0 = aggressive).
+        saturation: Color saturation multiplier (1.0 = original, 1.2 = slight boost).
+
+    Returns:
+        Enhanced (H, W, 3) float32 array, values in [0, 1].
+    """
+    pil = Image.fromarray((image_rgb * 255).clip(0, 255).astype(np.uint8), mode="RGB")
+
+    if sharpen > 0:
+        pil = pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen * 1.5,
+            percent=int(80 + sharpen * 60),
+            threshold=2,
+        ))
+
+    if saturation != 1.0:
+        pil = ImageEnhance.Color(pil).enhance(saturation)
+
+    return np.array(pil, dtype=np.float32) / 255.0
+
+
+def save_texture(image_rgb: np.ndarray, path: Path,
+                 sharpen: float = 1.5, saturation: float = 1.2) -> None:
+    """Save satellite texture as lossless PNG with sharpening and saturation boost."""
+    enhanced = enhance_texture(image_rgb, sharpen=sharpen, saturation=saturation)
+    arr = (enhanced * 255).clip(0, 255).astype(np.uint8)
+    Image.fromarray(arr, mode="RGB").save(str(path), format="PNG")
 
 
 def save_heightmap(heightmap: np.ndarray, path: Path) -> None:
@@ -34,6 +74,7 @@ def save_obj(
     path: Path,
     texture_name: str | None = None,
     scale_z: float = 0.3,
+    y_up: bool = False,
 ) -> None:
     """
     Export terrain as a Wavefront OBJ triangle mesh.
@@ -49,6 +90,9 @@ def save_obj(
         path:         Output .obj file path.
         texture_name: If given, a companion .mtl file is written and referenced.
         scale_z:      Vertical exaggeration factor relative to XY extent.
+        y_up:         If True, emit Y-up axes (X/Z ground plane, Y = height)
+                      for Unity / Godot / most game engines.
+                      If False (default), emit Z-up axes for Blender.
     """
     H, W = heightmap.shape
     z_scale = max(H, W) * scale_z
@@ -71,9 +115,17 @@ def save_obj(
         # Vertices  (v x y z)
         for row in range(H):
             for col in range(W):
-                x = float(col)
-                y = float(H - 1 - row)   # flip so row 0 is "north"
-                z = float(heightmap[row, col]) * z_scale
+                h = float(heightmap[row, col]) * z_scale
+                if y_up:
+                    # Y-up: ground plane is XZ, Y = elevation
+                    x = float(col)
+                    y = h
+                    z = float(H - 1 - row)
+                else:
+                    # Z-up (Blender default): ground plane is XY, Z = elevation
+                    x = float(col)
+                    y = float(H - 1 - row)
+                    z = h
                 f.write(f"v {x:.4f} {y:.4f} {z:.4f}\n")
 
         f.write("\n")

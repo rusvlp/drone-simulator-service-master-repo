@@ -1,11 +1,36 @@
 
 services:
   frontend:
+    container_name:
+      frontend
     build:
       \diploma-frontend
     ports:
       - "3000:5173"
+    depends_on:
+      gateway:
+        condition: service_started
 
-    gateway:
-      build:
-       \diploma-gateway
+  gateway:
+    container_name:
+      gateway
+    build:
+      \diploma-gateway
+    ports: 
+      - 8081:8080
+
+  migrate:
+    container_name:
+      migrate
+    build:
+      ..\diploma-gateway\
+    depends_on:
+      database:
+        condition: service_started
+
+
+  database:
+    container_name:
+      database
+    imgage:
+      postgres:18.3-bookworm
