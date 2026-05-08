@@ -221,7 +221,7 @@ def process(
     print(f"  -> {color_path}")
 
     if export_obj:
-        mesh_hmap = _subsample(hmap, max_dim=512)
+        mesh_hmap = _subsample(hmap, max_dim=256)
         mH, mW = mesh_hmap.shape
         obj_path = output_dir / f"{stem}_terrain.obj"
         st.save_obj(mesh_hmap, obj_path, texture_name=obj_texture, scale_z=scale_z, y_up=y_up)

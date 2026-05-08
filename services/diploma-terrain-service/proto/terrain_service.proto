@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package terrainservice;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "proto/terrainservicepb";
+
+service TerrainService {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  rpc GetUserJobs(GetUserJobsRequest) returns (GetUserJobsResponse);
+  rpc GetLimit(GetLimitRequest) returns (GetLimitResponse);
+  rpc SetLimit(SetLimitRequest) returns (SetLimitResponse);
+}
+
+message SubmitJobRequest {
+  string user_id    = 1;
+  bytes  image      = 2;
+  float  scale_z    = 3;
+  bool   y_up       = 4;
+  string texture_mode = 5;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message GetJobStatusResponse {
+  string job_id      = 1;
+  string status      = 2;
+  string model_url   = 3;
+  string texture_url = 4;
+  string error       = 5;
+  google.protobuf.Timestamp created_at = 6;
+  string trees_url   = 7;
+}
+
+message GetUserJobsRequest {
+  string user_id = 1;
+}
+
+message GetUserJobsResponse {
+  repeated GetJobStatusResponse jobs = 1;
+}
+
+message GetLimitRequest {
+  string user_id = 1;
+}
+
+message GetLimitResponse {
+  string user_id     = 1;
+  int32  daily_limit = 2;
+  int32  used_today  = 3;
+  google.protobuf.Timestamp reset_at = 4;
+}
+
+message SetLimitRequest {
+  string user_id     = 1;
+  int32  daily_limit = 2;
+}
+
+message SetLimitResponse {
+  string user_id     = 1;
+  int32  daily_limit = 2;
+}

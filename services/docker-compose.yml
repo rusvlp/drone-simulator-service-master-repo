@@ -16,20 +16,37 @@ services:
       gateway
     build:
       \diploma-gateway
-    ports: 
+    ports:
       - 8081:8080
+    env_file:
+      ./diploma-gateway/.env
+    depends_on:
+      database:
+        condition: service_healthy
+      terrain_service:
+        condition: service_started
 
-  # migrate:
-  #   container_name:
-  #     migrate
-  #   build:
-  #     context: .
-  #     dockerfile: \migrate-service\Dockerfile
-  #   env_file:
-  #     .\diploma-gateway\.env
-  #   depends_on:
-  #     database:
-  #       condition: service_healthy
+  user_service:
+    container_name:
+      user_service
+    build:
+      \diploma-user-service\
+    ports:
+      - 50051:50051
+    depends_on:
+      database:
+        condition: service_healthy
+
+  course_service:
+    container_name:
+      course_service
+    build:
+      \diploma-course-service\
+    ports:
+      - 50052:50052
+    depends_on:
+      database:
+        condition: service_healthy
 
   database:
     container_name:
@@ -37,11 +54,96 @@ services:
     image:
       postgres:18.3-bookworm
     env_file:
-      .\diploma-gateway\.env
+      ./diploma-gateway/.env
+    environment:
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: superStrongPassword
+      POSTGRES_DB: diploma
     ports:
       - 5433:5432
     healthcheck:
-       test: ["CMD-SHELL", "pg_isready -U user"]
-       interval: 5s
-       timeout: 5s
-       retries: 5
+      test: ["CMD-SHELL", "pg_isready -U postgres_user -d diploma"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  terrain_service:
+    container_name: terrain_service
+    build:
+      \diploma-terrain-service\
+    ports:
+      - 50053:50053
+    env_file:
+      - ./diploma-terrain-service/.env
+    depends_on:
+      database:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  zookeeper:
+    container_name: zookeeper
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: "*"
+    healthcheck:
+      test: ["CMD-SHELL", "zookeeper-shell localhost:2181 ls / 2>&1 | grep -q zookeeper"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka:
+    container_name: kafka
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_MESSAGE_MAX_BYTES: 20971520
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 20971520
+      KAFKA_MAX_REQUEST_SIZE: 20971520
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: [ "bash", "-c",
+      "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic terrain.requests --partitions 1 --replication-factor 1 &&
+       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic terrain.results  --partitions 1 --replication-factor 1 &&
+       echo 'Topics ready.'" ]
+    restart: "no"
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    env_file:
+      - ./diploma-gateway/.env
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+volumes:
+  minio_data:
