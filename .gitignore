@@ -1,0 +1,14 @@
+text/
+vrdronesimulator/
+
+# LaTeX build artifacts
+*.aux
+*.bcf
+*.log
+*.out
+*.toc
+*.run.xml
+*.bbl
+*.blg
+x.log
+todo.txt

@@ -108,32 +108,49 @@ def analyze_neural(
     tile_size: int = 512,
     overlap: int = 64,
     return_texture: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    return_veg_mask: bool = False,
+) -> np.ndarray | tuple:
     """
     Estimate a terrain heightmap using a neural segmentation backbone.
 
     Args:
-        image_rgb:      (H, W, 3) float32 array, values in [0, 1].
-        backbone:       'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
-        device:         'auto', 'cpu', 'cuda', or 'mps'.
-        tile_size:      Tile size for large-image tiling (default: 512).
-        overlap:        Overlap between tiles in pixels (default: 64).
-        return_texture: When True, also return (H, W, 3) float32 segmentation texture.
+        image_rgb:       (H, W, 3) float32 array, values in [0, 1].
+        backbone:        'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
+        device:          'auto', 'cpu', 'cuda', or 'mps'.
+        tile_size:       Tile size for large-image tiling (default: 512).
+        overlap:         Overlap between tiles in pixels (default: 64).
+        return_texture:  When True, also return (H, W, 3) float32 segmentation texture.
+        return_veg_mask: When True, also return (H, W) bool vegetation mask derived
+                         directly from segmentation class indices (tree/plant/shrub).
 
     Returns:
-        raw_heights (H, W) float32, or (raw_heights, texture_rgb) when return_texture=True.
+        raw_heights (H, W) float32.
+        Followed by texture_rgb (H, W, 3) if return_texture.
+        Followed by veg_mask (H, W) bool if return_veg_mask.
     """
     from .segmenter import segment as _neural
 
     gray = _luminance(image_rgb)
 
-    seg_result  = _neural(image_rgb, backbone=backbone, device=device,
-                          tile_size=tile_size, overlap=overlap,
-                          return_texture=return_texture)
-    if return_texture:
+    seg_result = _neural(image_rgb, backbone=backbone, device=device,
+                         tile_size=tile_size, overlap=overlap,
+                         return_texture=return_texture,
+                         return_veg_mask=return_veg_mask)
+
+    # Unpack depending on which extras were requested
+    if return_texture and return_veg_mask:
+        h_neural, seg_texture, seg_veg_mask = seg_result
+    elif return_texture:
         h_neural, seg_texture = seg_result
+        seg_veg_mask = None
+    elif return_veg_mask:
+        h_neural, seg_veg_mask = seg_result
+        seg_texture = None
     else:
-        h_neural, seg_texture = seg_result, None
+        h_neural = seg_result
+        seg_texture = None
+        seg_veg_mask = None
+
     h_neural = h_neural.astype(np.float64)
 
     # Remove outlier class tiers (e.g. rock/mountain misclassified in flat scenes)
@@ -167,9 +184,14 @@ def analyze_neural(
     if h_max > h_min:
         height = (height - h_min) / (h_max - h_min)
 
+    extras = []
     if return_texture:
-        return height.astype(np.float32), seg_texture
-    return height.astype(np.float32)
+        extras.append(seg_texture)
+    if return_veg_mask:
+        extras.append(seg_veg_mask)
+
+    h = height.astype(np.float32)
+    return (h, *extras) if extras else h
 
 
 # ---------------------------------------------------------------------------

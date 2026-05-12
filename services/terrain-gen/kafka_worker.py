@@ -91,16 +91,18 @@ def _generate_trees(
     heightmap: np.ndarray,
     scale_z: float,
     y_up: bool = False,
-    seg_texture: "np.ndarray | None" = None,
+    seg_veg_mask: "np.ndarray | None" = None,
 ) -> dict:
     """
-    Generates tree positions from semantic segmentation (preferred) or ExG fallback.
-    Works correctly for autumn/winter images where foliage is brown, not green.
+    Generates tree positions from semantic segmentation class indices (primary)
+    with RGB ExG as fallback/supplement. seg_veg_mask is a (H, W) bool array
+    derived directly from ADE20K class IDs (tree=4, plant=17, etc.) — not from
+    color approximation.
     y_up is stored in JSON so the viewer knows the OBJ axis convention.
     """
     from scipy.ndimage import binary_erosion, binary_dilation
 
-    sea_level = 0.10
+    sea_level = 0.08
 
     # Resize heightmap to image resolution if needed
     if heightmap.shape == image_rgb.shape[:2]:
@@ -115,44 +117,37 @@ def _generate_trees(
 
     H, W = image_rgb.shape[:2]
 
-    if seg_texture is not None:
-        # --- Segmentation-based detection (season-independent) ---
-        # Resize seg_texture to image resolution
-        if seg_texture.shape[:2] != (H, W):
-            from PIL import Image as _Img
-            seg_pil = _Img.fromarray((seg_texture * 255).astype(np.uint8))
-            seg_r = np.array(seg_pil.resize((W, H), _Img.NEAREST), dtype=np.float32) / 255.0
-        else:
-            seg_r = seg_texture
+    # --- RGB ExG: direct pixel-level green detection ---
+    R, G, B = image_rgb[:, :, 0], image_rgb[:, :, 1], image_rgb[:, :, 2]
+    exg = 2.0 * G - R - B
+    ngrdi = (G - R) / (G + R + 1e-8)
+    brightness = (R + G + B) / 3.0
+    rgb_veg = (exg > 0.04) & (ngrdi > 0.005) & (G > 0.10) & (brightness > 0.07) & (brightness < 0.88)
 
-        st_r, st_g = seg_r[:, :, 0], seg_r[:, :, 1]
-        # ADE20K vegetation colors in segmentation texture:
-        #   tree   (4):  (34,139,34)/255 → G≈0.545, G>>R
-        #   grass  (9):  (124,185,93)/255 → G≈0.725
-        #   plant (17):  (60,179,113)/255 → G≈0.702
-        # Water/rock/earth have low G or G≈R
-        veg_mask = (st_g > 0.35) & (st_g > st_r + 0.08)
-        erosion_iters, dilation_iters = 1, 1
+    if seg_veg_mask is not None:
+        # Resize segmentation mask to image resolution if needed
+        if seg_veg_mask.shape[:2] != (H, W):
+            from PIL import Image as _Img
+            seg_pil = _Img.fromarray(seg_veg_mask.astype(np.uint8) * 255)
+            seg_veg_mask = np.array(
+                seg_pil.resize((W, H), _Img.NEAREST), dtype=bool
+            )
+        # Union: tree wherever EITHER the neural model OR RGB ExG detects vegetation
+        veg_mask = seg_veg_mask | rgb_veg
     else:
-        # --- Fallback: ExG (works best on summer/green images) ---
-        R, G, B = image_rgb[:, :, 0], image_rgb[:, :, 1], image_rgb[:, :, 2]
-        exg = 2.0 * G - R - B
-        ngrdi = (G - R) / (G + R + 1e-8)
-        brightness = (R + G + B) / 3.0
-        veg_mask = (exg > 0.10) & (ngrdi > 0.01) & (G > 0.15) & (brightness > 0.12) & (brightness < 0.82)
-        erosion_iters, dilation_iters = 2, 1
+        veg_mask = rgb_veg
 
     # Exclude water / sea-level areas
-    veg_mask = veg_mask & (hmap_r > sea_level + 0.06)
+    veg_mask = veg_mask & (hmap_r > sea_level + 0.04)
 
-    # Morphological cleanup
-    veg_mask = binary_erosion(veg_mask, iterations=erosion_iters)
-    veg_mask = binary_dilation(veg_mask, iterations=dilation_iters)
+    # Light morphological cleanup
+    veg_mask = binary_erosion(veg_mask, iterations=1)
+    veg_mask = binary_dilation(veg_mask, iterations=1)
 
     rng = np.random.default_rng(42)
 
     # Grid sampling — one tree per cell, random position within vegetation pixels
-    cell_size = 12
+    cell_size = 3
     trees = []
     for cy in range(0, H, cell_size):
         for cx in range(0, W, cell_size):
@@ -178,7 +173,7 @@ def _generate_trees(
             })
 
     print(f"[worker] trees generated: {len(trees)} positions  "
-          f"({'seg' if seg_texture is not None else 'exg'} mode)")
+          f"({'seg+rgb' if seg_veg_mask is not None else 'rgb'} mode)")
     return {"count": len(trees), "scale_z": scale_z, "y_up": y_up, "trees": trees}
 
 
@@ -236,13 +231,15 @@ def _handle(msg: dict, minio: Minio, bucket: str, public_url: str) -> dict:
             texture_mode=texture_mode,
         )
 
-        # Rebuild heightmap + get segmentation texture for tree placement
+        # Rebuild heightmap + get vegetation mask for tree placement
+        # return_veg_mask uses ADE20K class indices directly (tree=4, plant=17, etc.)
+        # — no color approximation, same inference pass as heightmap generation
         import satellite_terrain as st
-        raw, seg_texture = st.analyze_neural(image_rgb, backbone="segformer", device="auto",
-                                             tile_size=512, overlap=64, return_texture=True)
+        raw, seg_veg_mask = st.analyze_neural(image_rgb, backbone="segformer", device="auto",
+                                              tile_size=512, overlap=64, return_veg_mask=True)
         heightmap = st.build(raw, smooth_sigma=3.0, sea_level=0.08)
 
-        trees_data = _generate_trees(image_rgb, heightmap, scale_z, y_up, seg_texture=seg_texture)
+        trees_data = _generate_trees(image_rgb, heightmap, scale_z, y_up, seg_veg_mask=seg_veg_mask)
         trees_path = out_dir / f"{job_id}_trees.json"
         trees_path.write_text(json.dumps(trees_data, separators=(",", ":")))
 

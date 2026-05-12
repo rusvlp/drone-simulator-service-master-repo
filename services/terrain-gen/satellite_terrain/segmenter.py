@@ -60,6 +60,14 @@ _ADE20K_ELEV: dict[int, float] = {
 # Sky is atmospheric — not terrain; falls back to spectral classifier.
 _ADE20K_SKY_CLS = 2
 
+# ADE20K classes that indicate tree/shrub/plant vegetation (used for tree placement)
+_ADE20K_VEG_CLASSES: frozenset[int] = frozenset([
+    4,   # tree / forest
+    17,  # plant / shrub
+    72,  # palm tree
+    9,   # grass (may include tree-covered slopes at satellite scale)
+])
+
 # ADE20K-150 class index → RGB color for segmentation texture
 _ADE20K_COLORS: dict[int, tuple[int, int, int]] = {
     4:   ( 34, 139,  34),  # tree
@@ -253,13 +261,15 @@ def _segment_tiled(
     overlap: int,
     color_map: dict[int, tuple[int, int, int]] | None = None,
     default_color: tuple[int, int, int] = (160, 130, 100),
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    veg_classes: frozenset[int] | None = None,
+) -> np.ndarray | tuple:
     """
     Process a large image tile-by-tile and blend results with linear-ramp weights.
 
     Tiles are placed on a regular grid with `overlap` pixels between neighbours.
     The final heightmap is the weighted average of all tiles at each pixel.
     When `color_map` is provided, also returns a blended RGB texture.
+    When `veg_classes` is provided, also returns a boolean vegetation mask.
     """
     H, W = image_rgb.shape[:2]
     stride = tile_size - overlap
@@ -280,6 +290,7 @@ def _segment_tiled(
     height_acc  = np.zeros((H, W), dtype=np.float64)
     weight_acc  = np.zeros((H, W), dtype=np.float64)
     texture_acc = np.zeros((H, W, 3), dtype=np.float64) if color_map is not None else None
+    veg_acc     = np.zeros((H, W), dtype=np.float64) if veg_classes is not None else None
 
     for idx, (y0, x0) in enumerate(
         (y, x) for y in y_starts for x in x_starts
@@ -300,18 +311,27 @@ def _segment_tiled(
             tile_tex = _classes_to_texture(seg_map, color_map, default_color)
             texture_acc[y0:y1, x0:x1] += tile_tex * weight[:, :, np.newaxis]
 
+        if veg_acc is not None:
+            tile_veg = np.isin(seg_map, list(veg_classes)).astype(np.float64)
+            veg_acc[y0:y1, x0:x1] += tile_veg * weight
+
         print(f"    [{idx + 1}/{n_tiles}]  y={y0}:{y1}  x={x0}:{x1}")
 
     valid  = weight_acc > 1e-9
     result = np.zeros((H, W), dtype=np.float32)
     result[valid] = (height_acc[valid] / weight_acc[valid]).astype(np.float32)
 
+    extras = []
     if texture_acc is not None:
         texture = np.zeros((H, W, 3), dtype=np.float32)
         texture[valid] = (texture_acc[valid] / weight_acc[valid, np.newaxis]).astype(np.float32)
-        return result, texture
+        extras.append(texture)
+    if veg_acc is not None:
+        veg_score = np.zeros((H, W), dtype=np.float32)
+        veg_score[valid] = (veg_acc[valid] / weight_acc[valid]).astype(np.float32)
+        extras.append(veg_score > 0.4)  # majority-vote threshold
 
-    return result
+    return (result, *extras) if extras else result
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +375,8 @@ def segment(
     tile_size: int = TILE_SIZE,
     overlap: int = TILE_OVERLAP,
     return_texture: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    return_veg_mask: bool = False,
+) -> np.ndarray | tuple:
     """
     Estimate terrain elevation from a satellite image via semantic segmentation.
 
@@ -364,16 +385,20 @@ def segment(
     px blending margin. Smaller images are processed in one pass.
 
     Args:
-        image_rgb:      (H, W, 3) float32 array, values in [0, 1].
-        backbone:       'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
-        device:         'auto', 'cpu', 'cuda', or 'mps'.
-        tile_size:      Side length of each tile in pixels (default: 512).
-        overlap:        Overlap between adjacent tiles in pixels (default: 64).
-        return_texture: When True, also return an (H, W, 3) float32 RGB texture
-                        where each pixel is colored by its semantic class.
+        image_rgb:       (H, W, 3) float32 array, values in [0, 1].
+        backbone:        'segformer' (ADE20K, default) or 'deeplabv3' (Pascal VOC).
+        device:          'auto', 'cpu', 'cuda', or 'mps'.
+        tile_size:       Side length of each tile in pixels (default: 512).
+        overlap:         Overlap between adjacent tiles in pixels (default: 64).
+        return_texture:  When True, also return an (H, W, 3) float32 RGB texture.
+        return_veg_mask: When True, also return a (H, W) bool vegetation mask
+                         based on tree/plant/shrub class indices directly from
+                         the segmentation model (no color approximation).
 
     Returns:
-        raw_heights (H, W) float32, or (raw_heights, texture_rgb) when return_texture=True.
+        raw_heights (H, W) float32.
+        Followed by texture_rgb (H, W, 3) if return_texture.
+        Followed by veg_mask (H, W) bool if return_veg_mask.
     """
     device = resolve_device(device)
 
@@ -383,25 +408,33 @@ def segment(
         sky_cls       = _ADE20K_SKY_CLS
         color_map     = _ADE20K_COLORS
         default_color = _ADE20K_DEFAULT_COLOR
+        veg_classes   = _ADE20K_VEG_CLASSES
     elif backbone == "deeplabv3":
         run_fn        = lambda img: _run_deeplabv3(img, device)
         elev_map      = _VOC_ELEV
         sky_cls       = None
         color_map     = _VOC_COLORS
         default_color = _VOC_DEFAULT_COLOR
+        veg_classes   = None  # VOC doesn't have reliable vegetation classes
     else:
         raise ValueError(f"Unknown backbone {backbone!r}. Choose 'segformer' or 'deeplabv3'.")
 
-    cm = color_map if return_texture else None
+    cm  = color_map if return_texture else None
+    vc  = veg_classes if return_veg_mask else None
     H, W = image_rgb.shape[:2]
 
     if max(H, W) > TILE_THRESHOLD:
         return _segment_tiled(image_rgb, run_fn, elev_map, sky_cls,
-                              tile_size, overlap, cm, default_color)
+                              tile_size, overlap, cm, default_color, vc)
 
     # Image fits in one pass.
     seg_map = run_fn(image_rgb)
     heights = _classes_to_heights(seg_map, image_rgb, elev_map, sky_cls).astype(np.float32)
+
+    extras = []
     if return_texture:
-        return heights, _classes_to_texture(seg_map, color_map, default_color)
-    return heights
+        extras.append(_classes_to_texture(seg_map, color_map, default_color))
+    if return_veg_mask and vc is not None:
+        extras.append(np.isin(seg_map, list(vc)))
+
+    return (heights, *extras) if extras else heights
