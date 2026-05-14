@@ -47,6 +47,8 @@ services:
     depends_on:
       database:
         condition: service_healthy
+      mongodb:
+        condition: service_healthy
 
   database:
     container_name:
@@ -144,6 +146,21 @@ services:
     volumes:
       - minio_data:/data
     restart: unless-stopped
+
+  mongodb:
+    image: mongo:8.3.1-noble
+    container_name: mongodb
+    env_file:
+      - ./diploma-gateway/.env
+    ports:
+      - "27017:27017"
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 
 volumes:
   minio_data:
